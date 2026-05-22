@@ -1475,6 +1475,18 @@ static int format_metrics(char *buf, int buflen) {
                 /* Only real device-backed mounts */
                 if (me->mnt_fsname[0] != '/')
                     continue;
+                /* Skip bind mounts: deduplicate by device — keep only the
+                   first mountpoint seen for each block device. Container
+                   runtimes (e.g. nvidia-container-toolkit) inject dozens of
+                   individual file bind-mounts from the same device, which
+                   would otherwise overflow the Prometheus buffer. */
+                {
+                    int dup = 0;
+                    for (int k = 0; k < n_disks; k++) {
+                        if (strcmp(disks[k].device, me->mnt_fsname) == 0) { dup = 1; break; }
+                    }
+                    if (dup) continue;
+                }
 
                 struct statvfs sv;
                 if (statvfs(me->mnt_dir, &sv) != 0)
