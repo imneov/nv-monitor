@@ -250,6 +250,108 @@ For fabric-level visibility (topology, per-peer bandwidth, congestion maps, hop-
 
 - Prometheus metrics exporter by [Tim Messerschmidt (@SeraphimSerapis)](https://github.com/SeraphimSerapis)
 
+## Container Deployment
+
+### Docker image
+
+Pre-built images are pushed to `quanzhenglong.com/edge/nv-monitor` on every commit to `main` and on tagged releases.
+
+```bash
+# Pull the latest release
+docker pull quanzhenglong.com/edge/nv-monitor:latest
+
+# Or a specific version
+docker pull quanzhenglong.com/edge/nv-monitor:0.1.0
+```
+
+### Docker run
+
+The container runs in headless Prometheus exporter mode by default (port 9101). GPU access requires the NVIDIA Container Toolkit.
+
+```bash
+docker run -d --name nv-monitor \
+  --runtime=nvidia \
+  --pid=host \
+  -v /proc:/host/proc:ro \
+  -v /sys:/host/sys:ro \
+  -p 9101:9101 \
+  quanzhenglong.com/edge/nv-monitor:latest
+```
+
+### Kubernetes DaemonSet
+
+Deploy as a DaemonSet to monitor every GPU node in your cluster:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nv-monitor
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: nv-monitor
+  template:
+    metadata:
+      labels:
+        app: nv-monitor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+    spec:
+      hostPID: true
+      runtimeClassName: nvidia
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nv-monitor
+          image: quanzhenglong.com/edge/nv-monitor:latest
+          ports:
+            - containerPort: 9101
+              name: metrics
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+```
+
+### Prometheus integration
+
+Add a scrape job targeting the DaemonSet pods via Kubernetes service discovery, or use the pod annotations above with Prometheus Operator's `PodMonitor`:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: nv-monitor
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: nv-monitor
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 15s
+```
+
 ## License
 
 MIT
