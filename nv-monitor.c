@@ -726,6 +726,10 @@ static void get_proc_cmdline(unsigned int pid, char *buf, int len) {
         fclose(f);
         if (n > 0) {
             buf[n] = '\0';
+            /* Truncate at consecutive nulls (padding from prctl/cmdline) */
+            for (int i = 0; i < n - 1; i++) {
+                if (buf[i] == '\0' && buf[i+1] == '\0') { n = i; buf[i] = '\0'; break; }
+            }
             /* Replace nulls with spaces */
             for (int i = 0; i < n - 1; i++)
                 if (buf[i] == '\0') buf[i] = ' ';
@@ -1300,7 +1304,7 @@ static void read_rdma_ports(void) {
 static int   prom_sock = -1;
 static pthread_t prom_thread;
 
-#define PROM_BYTES_PER_GPU 512  /* estimated Prometheus output per GPU */
+#define PROM_BYTES_PER_GPU 4096  /* increased for per-process metrics */  /* estimated Prometheus output per GPU */
 #define PROM_BASE_SIZE 8192     /* base buffer for CPU/memory/system metrics */
 
 typedef struct {
@@ -1317,6 +1321,16 @@ typedef struct {
     int      has_fan;
     unsigned int enc, dec;
     int      has_enc, has_dec;
+    unsigned long long proc_mem_used;
+    int      proc_count;
+    /* Per-process GPU memory detail */
+    struct {
+        unsigned int pid;
+        unsigned long long mem_bytes;
+        char name[128];
+        char type;  /* 'C' = compute, 'G' = graphics */
+    } procs[32];
+    int n_procs;
 } PromGpu;
 
 static int      prom_buf_size = 0;
@@ -1586,6 +1600,59 @@ static int format_metrics(char *buf, int buflen) {
                           pNvmlDeviceGetEncoderUtilization(dev, &g->enc, &period) == NVML_SUCCESS);
             g->has_dec = (pNvmlDeviceGetDecoderUtilization &&
                           pNvmlDeviceGetDecoderUtilization(dev, &g->dec, &period) == NVML_SUCCESS);
+            /* Collect process GPU memory (for unified-memory GPUs like GB10) */
+            {
+                nvmlProcessInfo_t cprocs[64], gprocs[64];
+                unsigned int nc = 64, ng = 64;
+                g->proc_mem_used = 0;
+                g->proc_count = 0;
+                g->n_procs = 0;
+
+                /* Compute processes */
+                if (pNvmlDeviceGetComputeRunningProcesses) {
+                    int rc = pNvmlDeviceGetComputeRunningProcesses(dev, &nc, cprocs);
+                    if (rc == NVML_SUCCESS) {
+                        for (unsigned int i = 0; i < nc && g->n_procs < 32; i++) {
+                            if (cprocs[i].pid == 0 || cprocs[i].pid > 4194304) continue;
+                            unsigned long long pmem = cprocs[i].usedGpuMemory;
+                            if (pmem != 0xFFFFFFFFFFFFFFFFULL && pmem > 0) {
+                                g->proc_mem_used += pmem;
+                                g->proc_count++;
+                                g->procs[g->n_procs].pid = cprocs[i].pid;
+                                g->procs[g->n_procs].mem_bytes = pmem;
+                                g->procs[g->n_procs].type = 'C';
+                                get_proc_cmdline(cprocs[i].pid, g->procs[g->n_procs].name, sizeof(g->procs[g->n_procs].name));
+                                g->n_procs++;
+                            }
+                        }
+                    }
+                }
+
+                /* Graphics processes */
+                if (pNvmlDeviceGetGraphicsRunningProcesses) {
+                    int rc = pNvmlDeviceGetGraphicsRunningProcesses(dev, &ng, gprocs);
+                    if (rc == NVML_SUCCESS) {
+                        for (unsigned int i = 0; i < ng && g->n_procs < 32; i++) {
+                            if (gprocs[i].pid == 0 || gprocs[i].pid > 4194304) continue;
+                            /* Skip duplicates */
+                            int dup = 0;
+                            for (int j = 0; j < g->n_procs; j++)
+                                if (g->procs[j].pid == gprocs[i].pid) { dup = 1; break; }
+                            if (dup) continue;
+                            unsigned long long pmem = gprocs[i].usedGpuMemory;
+                            if (pmem != 0xFFFFFFFFFFFFFFFFULL && pmem > 0) {
+                                g->proc_mem_used += pmem;
+                                g->proc_count++;
+                                g->procs[g->n_procs].pid = gprocs[i].pid;
+                                g->procs[g->n_procs].mem_bytes = pmem;
+                                g->procs[g->n_procs].type = 'G';
+                                get_proc_cmdline(gprocs[i].pid, g->procs[g->n_procs].name, sizeof(g->procs[g->n_procs].name));
+                                g->n_procs++;
+                            }
+                        }
+                    }
+                }
+            }
             n_gpus++;
         }
     }
@@ -1667,6 +1734,37 @@ static int format_metrics(char *buf, int buflen) {
         for (int d = 0; d < n_gpus; d++)
             if (gpus[d].has_power)
                 PM("nv_gpu_power_peak_30m_watts{gpu=\"%d\"} %.1f\n", d, peak_gpu_power_mw[d].peak);
+
+        /* Process-aggregated GPU memory (for unified-memory GPUs like GB10) */
+        PM("# HELP nv_gpu_process_memory_used_bytes Total GPU memory used by processes\n"
+           "# TYPE nv_gpu_process_memory_used_bytes gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            if (gpus[d].proc_mem_used > 0)
+                PM("nv_gpu_process_memory_used_bytes{gpu=\"%d\"} %llu\n", d, gpus[d].proc_mem_used);
+
+        PM("# HELP nv_gpu_process_count Number of processes using GPU\n"
+           "# TYPE nv_gpu_process_count gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            PM("nv_gpu_process_count{gpu=\"%d\"} %d\n", d, gpus[d].proc_count);
+
+        PM("# HELP nv_gpu_process_memory_bytes Per-process GPU memory usage\n"
+           "# TYPE nv_gpu_process_memory_bytes gauge\n");
+        for (int d = 0; d < n_gpus; d++)
+            for (int p = 0; p < gpus[d].n_procs; p++) {
+                /* Sanitize process name for Prometheus label (replace quotes) */
+                char safe_name[128];
+                int si = 0;
+                for (int ci = 0; gpus[d].procs[p].name[ci] && si < 126; ci++) {
+                    char c = gpus[d].procs[p].name[ci];
+                    if (c == '"' || c == '\\' || c == '\n')
+                        safe_name[si++] = '_';
+                    else
+                        safe_name[si++] = c;
+                }
+                safe_name[si] = 0;
+                PM("nv_gpu_process_memory_bytes{gpu=\"%d\",pid=\"%u\",name=\"%s\",type=\"%c\"} %llu\n",
+                   d, gpus[d].procs[p].pid, safe_name, gpus[d].procs[p].type, gpus[d].procs[p].mem_bytes);
+            }
     }
 
     /* RDMA / InfiniBand */
