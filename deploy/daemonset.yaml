@@ -35,6 +35,11 @@ spec:
             - containerPort: 9101
               name: metrics
               hostPort: 9101
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: utility
           resources:
             requests:
               cpu: 10m
