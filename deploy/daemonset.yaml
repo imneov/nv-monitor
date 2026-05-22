@@ -24,7 +24,7 @@ spec:
     spec:
       hostPID: true
       nodeSelector:
-        nvidia.com/gpu.product: GB10
+        nvidia.com/gpu.product: NVIDIA-GB10
       tolerations:
         - operator: Exists
       containers:
